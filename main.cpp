@@ -8,6 +8,9 @@
 // 顶点数据 (位置/颜色) 由 CPU 端在 kVertices 里定义，通过暂存缓冲上传到
 // 设备本地的顶点缓冲，再在命令缓冲里绑定给管线。
 //
+// 多重采样: 渲染先写进 4x MSAA 图像，render pass 结束时自动 resolve
+// 到交换链图像上，从而消掉三角形边缘的锯齿。
+//
 // 编译: cmake -B build && cmake --build build
 // 运行: ./build/main
 
@@ -141,6 +144,13 @@ struct App {
   std::vector<VkImage> swapchainImages;
   std::vector<VkImageView> swapchainImageViews;
   std::vector<VkFramebuffer> framebuffers;
+
+  // 多重采样: 渲染先画到这张 MSAA 图像，再由 render pass resolve 到交换链图像。
+  // 它的尺寸依赖交换链，所以要跟着交换链一起重建。
+  VkSampleCountFlagBits msaaSamples = VK_SAMPLE_COUNT_1_BIT;
+  VkImage msaaImage = VK_NULL_HANDLE;
+  VkDeviceMemory msaaImageMemory = VK_NULL_HANDLE;
+  VkImageView msaaImageView = VK_NULL_HANDLE;
 
   VkRenderPass renderPass = VK_NULL_HANDLE;
   VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
@@ -466,24 +476,41 @@ void createImageViews(App &app) {
 // ---------------------------------------------------------------------------
 
 void createRenderPass(App &app) {
+  // 附件 0: 多重采样颜色附件，片元着色器先写到这里
+  VkAttachmentDescription msaaAttachment{};
+  msaaAttachment.format = app.swapchainFormat;
+  msaaAttachment.samples = app.msaaSamples;
+  msaaAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;  // 每帧先清屏
+  msaaAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  msaaAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  msaaAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  msaaAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  msaaAttachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+  // 附件 1: 普通的 1x 附件，也就是交换链图像，作为 resolve 的目标
   VkAttachmentDescription colorAttachment{};
   colorAttachment.format = app.swapchainFormat;
   colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
-  colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;  // 每帧先清屏
+  colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;  // 内容会被 resolve 覆盖
   colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
   colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
   colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
   colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
-  VkAttachmentReference colorRef{};
-  colorRef.attachment = 0;
-  colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  VkAttachmentReference msaaRef{};
+  msaaRef.attachment = 0;
+  msaaRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+  VkAttachmentReference resolveRef{};
+  resolveRef.attachment = 1;
+  resolveRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
   VkSubpassDescription subpass{};
   subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
   subpass.colorAttachmentCount = 1;
-  subpass.pColorAttachments = &colorRef;
+  subpass.pColorAttachments = &msaaRef;       // 着色器写的是 MSAA 附件
+  subpass.pResolveAttachments = &resolveRef;  // 子通道结束时自动 resolve 到这里
 
   // 让颜色附件的写入发生在正确的阶段
   VkSubpassDependency dependency{};
@@ -494,10 +521,12 @@ void createRenderPass(App &app) {
   dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
   dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 
+  const VkAttachmentDescription attachments[] = {msaaAttachment, colorAttachment};
+
   VkRenderPassCreateInfo createInfo{};
   createInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-  createInfo.attachmentCount = 1;
-  createInfo.pAttachments = &colorAttachment;
+  createInfo.attachmentCount = 2;
+  createInfo.pAttachments = attachments;
   createInfo.subpassCount = 1;
   createInfo.pSubpasses = &subpass;
   createInfo.dependencyCount = 1;
@@ -573,7 +602,8 @@ void createGraphicsPipeline(App &app) {
 
   VkPipelineMultisampleStateCreateInfo multisampling{};
   multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-  multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+  // 必须和 render pass 里颜色附件的采样数一致，否则创建管线会失败
+  multisampling.rasterizationSamples = app.msaaSamples;
 
   VkPipelineColorBlendAttachmentState blendAttachment{};
   blendAttachment.blendEnable = VK_FALSE;
@@ -622,11 +652,15 @@ void createGraphicsPipeline(App &app) {
 void createFramebuffers(App &app) {
   app.framebuffers.resize(app.swapchainImageViews.size());
   for (size_t i = 0; i < app.swapchainImageViews.size(); ++i) {
+    // 顺序必须和 render pass 里的附件索引一致: 0 = MSAA, 1 = resolve 目标
+    const VkImageView attachments[] = {app.msaaImageView,
+                                       app.swapchainImageViews[i]};
+
     VkFramebufferCreateInfo createInfo{};
     createInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     createInfo.renderPass = app.renderPass;
-    createInfo.attachmentCount = 1;
-    createInfo.pAttachments = &app.swapchainImageViews[i];
+    createInfo.attachmentCount = 2;
+    createInfo.pAttachments = attachments;
     createInfo.width = app.swapchainExtent.width;
     createInfo.height = app.swapchainExtent.height;
     createInfo.layers = 1;
@@ -789,6 +823,97 @@ void createVertexBuffer(App &app) {
 }
 
 // ---------------------------------------------------------------------------
+// 多重采样 (MSAA)
+// ---------------------------------------------------------------------------
+
+// 挑一个可用采样数。目标 4x，不支持就逐级降。
+// 需要同时满足: 设备队列的 framebufferColorSampleCounts 和该格式的 sampleCounts
+VkSampleCountFlagBits chooseSampleCount(App &app) {
+  VkPhysicalDeviceProperties props{};
+  vkGetPhysicalDeviceProperties(app.physicalDevice, &props);
+
+  VkImageFormatProperties formatProps{};
+  const VkResult result = vkGetPhysicalDeviceImageFormatProperties(
+      app.physicalDevice, app.swapchainFormat, VK_IMAGE_TYPE_2D,
+      VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0,
+      &formatProps);
+
+  VkSampleCountFlags counts = props.limits.framebufferColorSampleCounts;
+  if (result == VK_SUCCESS) {
+    counts &= formatProps.sampleCounts;
+  }
+
+  if (counts & VK_SAMPLE_COUNT_4_BIT) {
+    std::cout << "MSAA: 4x\n";
+    return VK_SAMPLE_COUNT_4_BIT;
+  }
+  if (counts & VK_SAMPLE_COUNT_2_BIT) {
+    std::cout << "MSAA: 2x (不支持 4x)\n";
+    return VK_SAMPLE_COUNT_2_BIT;
+  }
+  std::cout << "MSAA: 不可用，回退到 1x\n";
+  return VK_SAMPLE_COUNT_1_BIT;
+}
+
+// 创建多重采样颜色图像 (只当渲染目标用，不需要 CPU 访问)
+void createMsaaImage(App &app) {
+  VkImageCreateInfo imageInfo{};
+  imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  imageInfo.imageType = VK_IMAGE_TYPE_2D;
+  imageInfo.extent.width = app.swapchainExtent.width;
+  imageInfo.extent.height = app.swapchainExtent.height;
+  imageInfo.extent.depth = 1;
+  imageInfo.mipLevels = 1;
+  imageInfo.arrayLayers = 1;
+  imageInfo.format = app.swapchainFormat;  // 必须和交换链格式一致，resolve 才能做
+  imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+  imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+  imageInfo.samples = app.msaaSamples;  // 关键: 采样数
+  imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  VK_CHECK(vkCreateImage(app.device, &imageInfo, nullptr, &app.msaaImage));
+
+  // 图像也要显式分配并绑定显存 (和 buffer 一样的两步)
+  VkMemoryRequirements requirements{};
+  vkGetImageMemoryRequirements(app.device, app.msaaImage, &requirements);
+
+  VkMemoryAllocateInfo allocInfo{};
+  allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  allocInfo.allocationSize = requirements.size;
+  allocInfo.memoryTypeIndex = findMemoryType(
+      app, requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  VK_CHECK(vkAllocateMemory(app.device, &allocInfo, nullptr, &app.msaaImageMemory));
+  VK_CHECK(vkBindImageMemory(app.device, app.msaaImage, app.msaaImageMemory, 0));
+
+  VkImageViewCreateInfo viewInfo{};
+  viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  viewInfo.image = app.msaaImage;
+  viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  viewInfo.format = app.swapchainFormat;
+  viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  viewInfo.subresourceRange.baseMipLevel = 0;
+  viewInfo.subresourceRange.levelCount = 1;
+  viewInfo.subresourceRange.baseArrayLayer = 0;
+  viewInfo.subresourceRange.layerCount = 1;
+  VK_CHECK(vkCreateImageView(app.device, &viewInfo, nullptr, &app.msaaImageView));
+}
+
+void destroyMsaaImage(App &app) {
+  if (app.msaaImageView != VK_NULL_HANDLE) {
+    vkDestroyImageView(app.device, app.msaaImageView, nullptr);
+    app.msaaImageView = VK_NULL_HANDLE;
+  }
+  if (app.msaaImage != VK_NULL_HANDLE) {
+    vkDestroyImage(app.device, app.msaaImage, nullptr);
+    app.msaaImage = VK_NULL_HANDLE;
+  }
+  if (app.msaaImageMemory != VK_NULL_HANDLE) {
+    vkFreeMemory(app.device, app.msaaImageMemory, nullptr);
+    app.msaaImageMemory = VK_NULL_HANDLE;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 渲染
 // ---------------------------------------------------------------------------
 
@@ -844,6 +969,9 @@ void cleanupSwapchain(App &app) {
   }
   app.framebuffers.clear();
 
+  // MSAA 图像尺寸跟着交换链走，所以也在这里销毁
+  destroyMsaaImage(app);
+
   for (VkImageView view : app.swapchainImageViews) {
     vkDestroyImageView(app.device, view, nullptr);
   }
@@ -879,6 +1007,7 @@ void recreateSwapchain(App &app) {
 
   cleanupSwapchain(app);
   createSwapchain(app);
+  createMsaaImage(app);  // 尺寸变了，MSAA 图像要按新尺寸重建
   createRenderFinishedSemaphores(app);
   createImageViews(app);
   createFramebuffers(app);
@@ -1015,6 +1144,9 @@ void run(App &app) {
   pickPhysicalDevice(app);
   createLogicalDevice(app);
   createSwapchain(app);
+  // 采样数要用交换链的格式去查，所以必须放在 createSwapchain 之后
+  app.msaaSamples = chooseSampleCount(app);
+  createMsaaImage(app);
   createImageViews(app);
   createRenderPass(app);
   createGraphicsPipeline(app);
